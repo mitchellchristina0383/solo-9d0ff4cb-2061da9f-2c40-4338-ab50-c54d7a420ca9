@@ -12,6 +12,7 @@ from werkzeug.serving import make_server
 from common.config import parse_config
 from common.storage import atomic_write_json
 from gateway.app import create_app
+from gateway.cookies import TransientCookieJar
 
 
 class ThreadedServer:
@@ -288,3 +289,239 @@ def test_query_string_and_method_forwarded(gateway):
     response = http.post(server.url + "/a/deep?x=1&y=2", data=b"hi", timeout=10)
     assert response.status_code == 200
     assert response.headers["X-Gateway-Backend"] == "sample-b"
+
+
+def make_cookie_backend(name: str) -> Flask:
+    """Backend that records received Cookie headers and issues Path-scoped sid."""
+    app = Flask(f"cookie-backend-{name}")
+    app.config["seen_cookies"] = []
+    app.config["seen_prefixes"] = []
+
+    def _issue():
+        app.config["seen_cookies"].append(request.headers.get("Cookie"))
+        app.config["seen_prefixes"].append(request.headers.get("X-Forwarded-Prefix"))
+        try:
+            delay = int(request.args.get("delay_ms", "0"))
+        except ValueError:
+            delay = 0
+        time.sleep(max(0, min(delay, 10000)) / 1000.0)
+        response = Response("logged in")
+        response.set_cookie(
+            "sid",
+            f"{name}-session",
+            path=request.headers.get("X-Forwarded-Prefix", "/") or "/",
+            max_age=3600,
+            httponly=True,
+        )
+        return response
+
+    @app.post("/login")
+    @app.post("/<path:prefix>/login")
+    def login(prefix: str = ""):
+        return _issue()
+
+    @app.get("/echo")
+    @app.post("/echo")
+    @app.get("/<path:prefix>/echo")
+    @app.post("/<path:prefix>/echo")
+    def echo(prefix: str = ""):
+        app.config["seen_cookies"].append(request.headers.get("Cookie"))
+        app.config["seen_prefixes"].append(request.headers.get("X-Forwarded-Prefix"))
+        return Response(
+            json.dumps({"service": name, "cookie": request.headers.get("Cookie")}),
+            mimetype="application/json",
+        )
+
+    return app
+
+
+@pytest.fixture()
+def cookie_gateway(tmp_path, monkeypatch):
+    backend_a = make_cookie_backend("sample-a")
+    backend_b = make_cookie_backend("sample-b")
+    with ThreadedServer(backend_a) as a, ThreadedServer(backend_b) as b:
+        backends = {"sample-a": a.url, "sample-b": b.url}
+        config_path = tmp_path / "routes.json"
+        monkeypatch.setenv("CONFIG_PATH", str(config_path))
+        monkeypatch.delenv("BACKEND_CATALOG", raising=False)
+        app = create_app()
+        with ThreadedServer(app) as server:
+            yield server, config_path, backends, backend_a, backend_b
+
+
+def test_set_cookie_path_and_expiry_relayed_verbatim(cookie_gateway):
+    server, path, backends, _a, _b = cookie_gateway
+    write_config(
+        path,
+        backends,
+        [{"path": "/sample-a", "match": "prefix", "backend": "sample-a"}],
+    )
+    response = http.post(server.url + "/sample-a/login", timeout=10)
+    set_cookie = response.headers["Set-Cookie"]
+    # No Domain attribute, explicit Path preserved, expiry attributes kept.
+    assert "sid=sample-a-session" in set_cookie
+    assert "Path=/sample-a" in set_cookie
+    assert "Max-Age=3600" in set_cookie
+    assert "domain=" not in set_cookie.lower()
+    assert "Domain" not in set_cookie
+
+
+def test_forwarded_prefix_header_matches_route(cookie_gateway):
+    server, path, backends, a, _b = cookie_gateway
+    write_config(
+        path,
+        backends,
+        [{"path": "/sample-a", "match": "prefix", "backend": "sample-a"}],
+    )
+    http.get(server.url + "/sample-a/echo", timeout=10)
+    assert a.config["seen_prefixes"][-1] == "/sample-a"
+
+
+def test_multiple_sid_cookies_forwarded_in_order(cookie_gateway):
+    server, path, backends, a, _b = cookie_gateway
+    write_config(
+        path,
+        backends,
+        [{"path": "/sample-a", "match": "prefix", "backend": "sample-a"}],
+    )
+    response = http.get(
+        server.url + "/sample-a/echo",
+        headers={"Cookie": "sid=first; sid=second; other=z; sid=third"},
+        timeout=10,
+    )
+    assert response.json()["cookie"] == "sid=first; sid=second; other=z; sid=third"
+    assert a.config["seen_cookies"][-1] == "sid=first; sid=second; other=z; sid=third"
+
+
+def test_pooled_session_never_leaks_upstream_cookies(cookie_gateway):
+    """Cookies issued to one browser must never reach another request."""
+    server, path, backends, a, _b = cookie_gateway
+    write_config(
+        path,
+        backends,
+        [{"path": "/sample-a", "match": "prefix", "backend": "sample-a"}],
+    )
+    # First "browser" logs in; the upstream Set-Cookie would normally be stored
+    # by the pooled requests.Session.
+    login = http.post(server.url + "/sample-a/login", timeout=10)
+    assert "sid=sample-a-session" in login.headers["Set-Cookie"]
+
+    # A second browser sends no Cookie header, reusing the same pooled session.
+    bare = http.get(server.url + "/sample-a/echo", timeout=10)
+    assert bare.json()["cookie"] is None
+    assert a.config["seen_cookies"][-1] is None
+
+    # And a browser with its own cookie keeps exactly its own value.
+    own = http.get(
+        server.url + "/sample-a/echo",
+        headers={"Cookie": "sid=browser-two"},
+        timeout=10,
+    )
+    assert own.json()["cookie"] == "sid=browser-two"
+
+
+def test_transient_cookie_jar_discards_upstream_cookies():
+    jar = TransientCookieJar()
+    assert list(jar) == []
+    # The public write APIs used by requests must keep the jar empty.
+    jar.set_cookie_if_ok(object(), object())
+    assert list(jar) == []
+
+
+def test_one_backend_logout_keeps_other_backend_cookie(cookie_gateway):
+    """Two path-scoped sids coexist; only the matching one is sent per route."""
+    server, path, backends, a, b = cookie_gateway
+    write_config(
+        path,
+        backends,
+        [
+            {"path": "/sample-a", "match": "prefix", "backend": "sample-a"},
+            {"path": "/sample-b", "match": "prefix", "backend": "sample-b"},
+        ],
+    )
+    login_a = http.post(server.url + "/sample-a/login", timeout=10)
+    login_b = http.post(server.url + "/sample-b/login", timeout=10)
+    sid_a = login_a.cookies["sid"]
+    sid_b = login_b.cookies["sid"]
+    assert sid_a != sid_b
+
+    # A browser holding both cookies sends each one only on the matching
+    # route because their Path attributes differ.
+    resp_a = http.get(
+        server.url + "/sample-a/echo",
+        headers={"Cookie": f"sid={sid_a}"},
+        timeout=10,
+    )
+    resp_b = http.get(
+        server.url + "/sample-b/echo",
+        headers={"Cookie": f"sid={sid_b}"},
+        timeout=10,
+    )
+    assert resp_a.json()["cookie"] == f"sid={sid_a}"
+    assert resp_b.json()["cookie"] == f"sid={sid_b}"
+
+    # Logging out of A expires only the cookie whose Path is /sample-a.
+    # Build the expiry header exactly like the sample app's delete_cookie.
+    flask_app = Flask("logout-helper")
+
+    @flask_app.get("/expire")
+    def expire():
+        response = Response("bye")
+        response.delete_cookie(
+            "sid", path="/sample-a", httponly=True, samesite="Lax"
+        )
+        return response
+
+    expiry_header = flask_app.test_client().get("/expire").headers["Set-Cookie"]
+    assert "Path=/sample-a" in expiry_header
+    assert "Domain" not in expiry_header
+    # B's sid is an independent cookie and remains valid server-side.
+    assert b.config["seen_cookies"][-1] == f"sid={sid_b}"
+    assert sid_a != sid_b
+
+
+def test_late_set_cookie_after_repoint_still_belongs_to_original_backend(
+    cookie_gateway,
+):
+    """A slow login keeps its original backend even after a route repoint."""
+    server, path, backends, a, b = cookie_gateway
+    write_config(
+        path,
+        backends,
+        [{"path": "/app", "match": "prefix", "backend": "sample-a"}],
+        version=1,
+    )
+    # The slow login is delayed inside the sample backend; the route is
+    # repointed while the request is in flight.
+    results = {}
+
+    def slow_login():
+        results["response"] = http.post(
+            server.url + "/app/login?delay_ms=2000", timeout=30
+        )
+
+    thread = threading.Thread(target=slow_login)
+    thread.start()
+    time.sleep(0.5)
+    write_config(
+        path,
+        backends,
+        [{"path": "/app", "match": "prefix", "backend": "sample-b"}],
+        version=2,
+    )
+    fresh = http.post(server.url + "/app/login", timeout=10)
+    assert fresh.headers["X-Gateway-Backend"] == "sample-b"
+    assert "Path=/app" in fresh.headers["Set-Cookie"]
+
+    thread.join(timeout=30)
+    late = results["response"]
+    # The in-flight request completed against the original backend...
+    assert late.status_code == 200
+    assert late.headers["X-Gateway-Backend"] == "sample-a"
+    assert late.headers["X-Gateway-Config-Version"] == "1"
+    # ...and its late Set-Cookie is still the original backend's session,
+    # scoped to the same path so the browser stores it after switching back.
+    assert "sid=sample-a-session" in late.headers["Set-Cookie"]
+    assert "Path=/app" in late.headers["Set-Cookie"]
+    assert a.config["seen_prefixes"][0] == "/app"
+

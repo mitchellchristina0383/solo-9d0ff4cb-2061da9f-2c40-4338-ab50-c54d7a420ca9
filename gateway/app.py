@@ -16,6 +16,7 @@ from werkzeug.exceptions import HTTPException
 
 from common.config import GatewayConfig, catalog_from_env
 from gateway.config_store import ConfigStore
+from gateway.cookies import TransientCookieJar
 
 LOG = logging.getLogger("gateway")
 
@@ -48,6 +49,10 @@ RESERVED_PREFIX = "/__gateway"
 
 def _build_session() -> requests.Session:
     session = requests.Session()
+    # The session may be reused across many browser requests (and keeps its
+    # upstream connection pool).  It must never accumulate upstream cookies:
+    # every request carries only the Cookie header of its own browser.
+    session.cookies = TransientCookieJar()
     adapter = HTTPAdapter(pool_connections=16, pool_maxsize=64, max_retries=0)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
@@ -68,7 +73,7 @@ class _SessionPool:
         return session
 
 
-def _request_headers() -> dict[str, str]:
+def _request_headers(route_prefix: str) -> dict[str, str]:
     connection_tokens = {
         token.strip().lower()
         for token in request.headers.get("Connection", "").split(",")
@@ -84,6 +89,8 @@ def _request_headers() -> dict[str, str]:
         if lower in skip or lower == "accept-encoding":
             continue
         if lower in merged:
+            # Repeated Cookie lines carry separate name=value pairs; merging
+            # with "; " keeps the exact order the browser sent the cookies in.
             separator = "; " if lower == "cookie" else ", "
             merged[lower] = merged[lower] + separator + value
         else:
@@ -102,6 +109,10 @@ def _request_headers() -> dict[str, str]:
         headers["X-Forwarded-For"] = client_ip
     headers["X-Forwarded-Proto"] = request.scheme
     headers["X-Forwarded-Host"] = request.host
+    # The route prefix the browser used, without trailing slash.  Legacy
+    # backends use it to scope their Path-attribute cookies (e.g. ``sid``) so
+    # two apps behind the same gateway keep independent cookie jars.
+    headers["X-Forwarded-Prefix"] = route_prefix
     headers["X-Request-Id"] = g.request_id
     return headers
 
@@ -290,7 +301,7 @@ def create_app() -> Flask:
             upstream = pool.get().request(
                 request.method,
                 target,
-                headers=_request_headers(),
+                headers=_request_headers(route.path.rstrip("/") or "/"),
                 data=request.get_data(cache=False),
                 stream=True,
                 allow_redirects=False,

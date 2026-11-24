@@ -88,14 +88,18 @@ services:
     user: "10001:10001"
     command:
       - gunicorn
-      - --workers=2
-      - --threads=8
+      # In-memory login sessions require every request to hit the same store.
+      - --workers=1
+      - --threads=16
       - --timeout=180
       - --bind=0.0.0.0:9000
       - samples.app:app
     environment:
       SERVICE_NAME: sample-a
       SERVICE_COLOR: blue
+      # Used only for direct access (without the gateway); via the gateway the
+      # X-Forwarded-Prefix header overrides this.
+      COOKIE_PATH: /sample-a
     ports:
       - "9001:9000"
     healthcheck:
@@ -112,14 +116,16 @@ services:
     user: "10001:10001"
     command:
       - gunicorn
-      - --workers=2
-      - --threads=8
+      # In-memory login sessions require every request to hit the same store.
+      - --workers=1
+      - --threads=16
       - --timeout=180
       - --bind=0.0.0.0:9000
       - samples.app:app
     environment:
       SERVICE_NAME: sample-b
       SERVICE_COLOR: green
+      COOKIE_PATH: /sample-b
     ports:
       - "9002:9000"
     healthcheck:
